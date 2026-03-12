@@ -2,6 +2,7 @@
 #include "gguf.h"
 
 #include "common.h"
+#include "../src/llama-stream-debug.h"
 #include "log.h"
 #include "llama.h"
 #include "sampling.h"
@@ -1045,6 +1046,7 @@ struct common_init_result::impl {
 
 common_init_result::common_init_result(common_params & params) :
     pimpl(new impl{}) {
+    STREAM_DBG("common_init_result constructor entered");
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
@@ -1058,7 +1060,9 @@ common_init_result::common_init_result(common_params & params) :
             params.verbosity >= 4 ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
     }
 
+    STREAM_DBG("calling llama_model_load_from_file");
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
+    STREAM_DBG("llama_model_load_from_file returned %p", (void*)model);
     if (model == NULL) {
         return;
     }
@@ -1134,13 +1138,16 @@ common_init_result::common_init_result(common_params & params) :
         cparams.n_samplers = pimpl->samplers_seq_config.size();
     }
 
+    STREAM_DBG("calling llama_init_from_model");
     llama_context * lctx = llama_init_from_model(model, cparams);
+    STREAM_DBG("llama_init_from_model returned %p", (void*)lctx);
     if (lctx == NULL) {
         LOG_ERR("%s: failed to create context with model '%s'\n", __func__, params.model.path.c_str());
         return;
     }
 
     pimpl->context.reset(lctx);
+    STREAM_DBG("common_init_result constructor COMPLETE");
 }
 
 llama_model * common_init_result::model() {

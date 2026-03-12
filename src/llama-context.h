@@ -8,6 +8,7 @@
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
+#include "llama-streaming-context.h"
 
 #include <map>
 #include <vector>
@@ -356,4 +357,9 @@ private:
     mutable int32_t n_eval   = 0; // number of eval calls
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
+
+    // Streaming weight loader — when non-null, tensor data is fetched
+    // on demand from disk rather than being fully resident in memory.
+    // Shared from model.streaming_ctx, assigned in the constructor.
+    std::shared_ptr<LlamaStreamingContext> streaming_ctx;
 };

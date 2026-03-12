@@ -5,6 +5,7 @@
 #include "llama-impl.h"
 #include "llama-arch.h"
 #include "llama-mmap.h"
+#include "llama-streaming-context.h"
 
 #include "ggml-cpp.h"
 
@@ -89,6 +90,10 @@ struct llama_model_loader {
 
     std::string arch_name;
     LLM_KV      llm_kv    = LLM_KV(LLM_ARCH_UNKNOWN);
+
+    // Optional streaming context — when non-null, tensors registered here
+    // are skipped during load_all_data() and served on-demand at inference time.
+    std::unique_ptr<LlamaStreamingContext> streaming_ctx;
 
     size_t size_done = 0;
     size_t size_data = 0;

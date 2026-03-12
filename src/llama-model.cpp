@@ -1,5 +1,7 @@
 #include "llama-model.h"
 
+#include "llama-stream-debug.h"
+#include "llama-streaming-context.h"
 #include "llama-impl.h"
 #include "llama-mmap.h"
 #include "llama-cparams.h"
@@ -7715,11 +7717,21 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
     ml.done_getting_tensors();
 
-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    // Skip mmap entirely when streaming loader is active — mmap on a 377GB
+    // network share blocks for minutes. Streaming context owns all IO.
+    if (!ml.streaming_ctx) {
+        ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    } else {
+        ml.use_mmap = false;
+        ml.no_alloc = true;
+        ml.init_mappings(false, nullptr);
+        STREAM_DBG("init_mappings done, size_data=%zu", ml.size_data);
+    }
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
     std::vector<std::pair<ggml_context *, llama_buf_map>> ctx_buf_maps;
+    STREAM_DBG("starting ctx_buf_maps loop, ctx_map.size=%zu", ctx_map.size());
     ctx_buf_maps.reserve(ctx_map.size());
 
     // Ensure we have enough capacity for the maximum backend buffer we will potentially create
@@ -7776,9 +7788,18 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         } else {
             ggml_backend_buffer_t buf;
             if (ml.no_alloc) {
-                buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
+                // Streaming: just set sentinel data on all tensors so the allocator
+                // skips them. No real buffer needed — streaming context owns all data.
                 for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
-                    t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them
+                    if (t->data == nullptr) {
+                        t->data = (void*)(uintptr_t)1; // sentinel
+                    }
+                }
+                // Use a zero-size dummy buf just to satisfy bufs.emplace_back below
+                buf = ggml_backend_buft_alloc_buffer(buft, 0);
+                if (buf == nullptr) {
+                    // Some backends return null for size=0 — allocate 1 byte instead
+                    buf = ggml_backend_buft_alloc_buffer(buft, 1);
                 }
             } else {
                 buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
@@ -7839,21 +7860,33 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    if (ml.no_alloc) {
+    if (ml.no_alloc && !ml.streaming_ctx) {
         return true;
     }
 
+    STREAM_DBG("calling load_all_data for %zu ctx_buf_maps", ctx_buf_maps.size());
     // load tensor data
     for (auto & [ctx, buf_map] : ctx_buf_maps) {
+        STREAM_DBG("load_all_data for ctx...");
         if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
+            STREAM_DBG("load_all_data FAILED");
             return false;
         }
+        STREAM_DBG("load_all_data OK");
     }
+    STREAM_DBG("all load_all_data done, returning true");
 
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
         }
+    }
+
+    // Transfer streaming context ownership from loader -> model.
+    // llama_context will then grab a shared_ptr to it in its constructor.
+    if (ml.streaming_ctx) {
+        streaming_ctx = std::move(ml.streaming_ctx);
+        fprintf(stderr, "[STREAM-DBG] load_tensors: streaming_ctx transferred to model, ptr=%p\n", (void*)streaming_ctx.get());
     }
 
     return true;

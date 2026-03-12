@@ -836,6 +836,43 @@ static int llama_model_load(const std::string & fname, std::vector<std::string> 
     try {
         llama_model_loader ml(fname, splits, params.use_mmap, params.use_direct_io, params.check_tensors, params.no_alloc, params.kv_overrides, params.tensor_buft_overrides);
 
+        // ── Streaming weight loader (PoC) ─────────────────────────────────────────────
+        // When LLAMA_STREAMING_PATH env var is set to the GGUF file path,
+        // attach a LlamaStreamingContext so large tensors are served on demand
+        // instead of being fully resident in memory.
+        //
+        // To activate: set LLAMA_STREAMING_PATH=<path_to_gguf> before running.
+        // Optional:    LLAMA_STREAMING_CACHE_GIB=<N>  (default: 4 GiB)
+        //
+        // TODO: promote to a proper llama_model_params field + CLI flag.
+        {
+            const char * streaming_path_env = getenv("LLAMA_STREAMING_PATH");
+            // Activate streaming if LLAMA_STREAMING_PATH is set to this model's path.
+            // Normalize both paths before comparing (case-insensitive, / vs \).
+            auto normalize_path = [](std::string s) {
+                for (auto & c : s) { if (c == '/') c = '\\'; c = (char)tolower((unsigned char)c); }
+                // trim trailing whitespace
+                while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\r' || s.back() == '\n')) s.pop_back();
+                return s;
+            };
+            bool path_match = streaming_path_env &&
+                normalize_path(fname) == normalize_path(std::string(streaming_path_env));
+            fprintf(stderr, "[STREAM-DBG] streaming check: fname='%s' env='%s' match=%d\n",
+                fname.c_str(), streaming_path_env ? streaming_path_env : "(not set)", (int)path_match);
+            if (path_match) {
+                size_t cache_gib = 4;
+                const char * cache_env = getenv("LLAMA_STREAMING_CACHE_GIB");
+                if (cache_env) {
+                    cache_gib = (size_t) atoi(cache_env);
+                    if (cache_gib == 0) cache_gib = 4;
+                }
+                const size_t cache_bytes = cache_gib * 1024ULL * 1024ULL * 1024ULL;
+                LLAMA_LOG_INFO("%s: streaming weight loader enabled (cache = %zu GiB)\n", __func__, cache_gib);
+                ml.streaming_ctx = std::make_unique<LlamaStreamingContext>(fname, cache_bytes);
+            }
+        }
+        // ── End streaming weight loader ─────────────────────────────────────────────
+
         ml.print_info();
 
         model.hparams.vocab_only = params.vocab_only;

@@ -17,6 +17,7 @@
 struct llama_cparams;
 struct llama_ubatch;
 struct llama_model_loader;
+class  LlamaStreamingContext;
 
 // available models
 enum llm_type {
@@ -513,6 +514,10 @@ struct llama_model {
 
     int64_t t_load_us  = 0;
     int64_t t_start_us = 0;
+
+    // Streaming weight loader — when non-null, tensor data is fetched on demand.
+    // Shared with llama_context so both can access the streaming context.
+    std::shared_ptr<LlamaStreamingContext> streaming_ctx;
 
     explicit llama_model(const struct llama_model_params & params);
     ~llama_model();

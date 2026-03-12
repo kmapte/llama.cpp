@@ -1931,6 +1931,7 @@ private:
     }
 
     void update_slots() {
+        fprintf(stderr, "[STREAM-DBG] update_slots() entered\n");
         // check if all slots are idle
         {
             bool all_idle = true;
@@ -1943,11 +1944,13 @@ private:
             }
 
             if (all_idle) {
+                fprintf(stderr, "[STREAM-DBG] update_slots: all idle, returning\n");
                 SRV_INF("%s", "all slots are idle\n");
 
                 return;
             }
         }
+        fprintf(stderr, "[STREAM-DBG] update_slots: slots are active, continuing\n");
 
         {
             SRV_DBG("%s", "posting NEXT_RESPONSE\n");
@@ -2619,7 +2622,9 @@ private:
                 batch.logits   + i,
             };
 
+            fprintf(stderr, "[STREAM-DBG] calling llama_decode, n_tokens=%d\n", n_tokens);
             const int ret = llama_decode(ctx, batch_view);
+            fprintf(stderr, "[STREAM-DBG] llama_decode returned %d\n", ret);
 
             metrics.on_decoded(slots);
 

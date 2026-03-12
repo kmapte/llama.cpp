@@ -1092,6 +1092,32 @@ bool llama_model_loader::load_all_data(
 
         size_t n_size = ggml_nbytes(cur);
 
+        // ── Streaming bypass ──────────────────────────────────────────────────
+        // If this tensor is managed by the streaming context, skip data
+        // allocation entirely. The tensor's data pointer stays null; it will
+        // be filled by LlamaStreamingContext::get_tensor_data() at inference.
+        if (streaming_ctx && streaming_ctx->is_streaming(ggml_get_name(cur))) {
+            // Clear the dummy buffer that no_alloc assigned — streaming context
+            // owns this tensor's data. register_tensor() sets data=SENTINEL so
+            // ggml_gallocr won't try to re-allocate it.
+            cur->buffer = nullptr;
+            streaming_ctx->register_tensor(ggml_get_name(cur), cur);
+            // NOTE: do NOT prefetch here — data is fetched on demand at inference time only
+            size_done += n_size;
+            LLAMA_LOG_DEBUG("%s: streaming tensor '%s' (%.2f MiB) — skipping allocation\n",
+                __func__, ggml_get_name(cur), (double)n_size / (1024.0 * 1024.0));
+            continue;
+        }
+        // ── End streaming bypass ──────────────────────────────────────────────
+
+        // When streaming is active, all tensors have sentinel data=(void*)1 from
+        // the no_alloc dummy buffer pass. Skip any tensor whose data is null or
+        // sentinel — real data is filled at inference time.
+        if (streaming_ctx && (cur->data == nullptr || cur->data == (void*)(uintptr_t)1)) {
+            size_done += n_size;
+            continue;
+        }
+
         if (use_mmap) {
             const auto & mapping = mappings.at(weight->idx);
             ggml_backend_buffer_t buf_mmap = nullptr;

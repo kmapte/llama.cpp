@@ -1,6 +1,8 @@
 #include "llama-context.h"
 
 #include "llama-arch.h"
+#include "llama-stream-debug.h"
+#include "llama-streaming-context.h"
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
@@ -25,6 +27,10 @@ llama_context::llama_context(
     cvec(std::make_unique<llama_adapter_cvec>()),
     loras(std::make_unique<llama_adapter_loras>()),
     balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd())) {
+    STREAM_DBG("llama_context constructor entered");
+    // Inherit streaming context from model (populated during load_tensors)
+    streaming_ctx = model.streaming_ctx;
+    fprintf(stderr, "[STREAM-DBG] ctor: streaming_ctx=%p (from model=%p)\n", (void*)streaming_ctx.get(), (void*)model.streaming_ctx.get());
     // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
     //     may need to be backend-dependent
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
@@ -339,24 +345,30 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
+        STREAM_DBG("calling sched_reserve");
         sched_reserve();
+        STREAM_DBG("sched_reserve done");
 
         if (!cparams.flash_attn) {
+            STREAM_DBG("flash_attn off, checking type_v=%d", (int)params.type_v);
             if (ggml_is_quantized(params.type_v)) {
                 throw std::runtime_error("quantized V cache was requested, but this requires Flash Attention");
             }
         }
+        STREAM_DBG("flash_attn check passed");
     }
 
+    STREAM_DBG("initializing vocab token ids");
     // Initialize the full vocabulary token ids for backend samplers.
     {
         const int n_vocab = model.vocab.n_tokens();
-
+        STREAM_DBG("n_vocab=%d", n_vocab);
         sampling.token_ids_full_vocab.resize(n_vocab);
         for (int i = 0; i < n_vocab; ++i) {
             sampling.token_ids_full_vocab[i] = i;
         }
     }
+    STREAM_DBG("constructor COMPLETE");
 }
 
 llama_context::~llama_context() {
@@ -467,9 +479,11 @@ void llama_context::sched_reserve() {
     int n_nodes_tg  = -1;
 
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
+    STREAM_DBG("about to graph_reserve pp n_tokens=%u n_seqs=%u", n_tokens, n_seqs);
     {
         auto * gf = graph_reserve(n_tokens, n_seqs, n_tokens, mctx.get(),
                 model.hparams.no_alloc, model.hparams.no_alloc ? backend_buf_exp_size.data() : nullptr);
+        STREAM_DBG("graph_reserve pp returned %p", (void*)gf);
         if (!gf) {
             if (cparams.pipeline_parallel) {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
@@ -487,8 +501,10 @@ void llama_context::sched_reserve() {
     }
 
     // reserve with tg (token generation) graph to get the number of splits and nodes
+    STREAM_DBG("about to graph_reserve tg");
     {
         auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), model.hparams.no_alloc);
+        STREAM_DBG("graph_reserve tg returned %p", (void*)gf);
         if (!gf) {
             throw std::runtime_error("failed to allocate compute tg buffers");
         }
@@ -498,29 +514,36 @@ void llama_context::sched_reserve() {
     }
 
     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
+    STREAM_DBG("about to graph_reserve pp2");
     {
-        // TODO: not sure if the following graph would be worster case for multi-stream KV caches:
-        //
-        // auto * gf = graph_reserve(n_tokens, 1, n_tokens, mctx.get());
-        //
         auto * gf = graph_reserve(n_tokens, n_seqs, n_tokens, mctx.get(), model.hparams.no_alloc);
+        STREAM_DBG("graph_reserve pp2 returned %p", (void*)gf);
         if (!gf) {
             throw std::runtime_error("failed to allocate compute pp buffers");
         }
     }
+    STREAM_DBG("all graph_reserves done");
 
+    fprintf(stderr, "[STREAM-DBG] entering backend buffer size loop, count=%zu\n", backend_ptrs.size());
     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+        fprintf(stderr, "[STREAM-DBG] backend loop i=%zu\n", i);
         ggml_backend_t             backend = backend_ptrs[i];
         ggml_backend_buffer_type_t buft    = backend_buft[i];
+        fprintf(stderr, "[STREAM-DBG] no_alloc=%d\n", (int)model.hparams.no_alloc);
         if (!model.hparams.no_alloc) {
+            fprintf(stderr, "[STREAM-DBG] calling get_buffer_size i=%zu\n", i);
             backend_buf_exp_size[i] = ggml_backend_sched_get_buffer_size(sched.get(), backend);
+            fprintf(stderr, "[STREAM-DBG] get_buffer_size done i=%zu size=%zu\n", i, backend_buf_exp_size[i]);
         }
+        fprintf(stderr, "[STREAM-DBG] checking buf_exp_size[%zu]=%zu\n", i, backend_buf_exp_size[i]);
         if (backend_buf_exp_size[i] > 1) {
+            fprintf(stderr, "[STREAM-DBG] calling ggml_backend_buft_name i=%zu\n", i);
             LLAMA_LOG_INFO("%s: %10s compute buffer size = %8.2f MiB\n", __func__,
                     ggml_backend_buft_name(buft),
                     backend_buf_exp_size[i] / 1024.0 / 1024.0);
         }
     }
+    fprintf(stderr, "[STREAM-DBG] backend buffer size loop done\n");
 
     if (n_nodes_pp == n_nodes_tg) {
         LLAMA_LOG_INFO("%s: graph nodes  = %d\n", __func__, n_nodes_pp);
@@ -654,11 +677,13 @@ bool llama_context::memory_update(bool optimize) {
     }
 
     // if the memory module did any computation, we have to reserve a new worst-case graph
+    fprintf(stderr, "[STREAM-DBG] memory_update: calling init_full\n");
     {
         const auto mctx = memory->init_full();
         if (!mctx) {
             throw std::runtime_error("failed to initialize memory context");
         }
+        fprintf(stderr, "[STREAM-DBG] memory_update: init_full done, calling graph_reserve\n");
 
         const uint32_t n_seqs = cparams.n_seq_max;
         const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
@@ -667,7 +692,9 @@ bool llama_context::memory_update(bool optimize) {
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to reserve graph after the memory update\n", __func__);
         }
+        fprintf(stderr, "[STREAM-DBG] memory_update: graph_reserve done\n");
     }
+    fprintf(stderr, "[STREAM-DBG] memory_update: returning true\n");
 
     return true;
 }
@@ -1068,14 +1095,17 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    fprintf(stderr, "[STREAM-DBG] process_ubatch entered, mctx=%p\n", (void*)mctx);
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
+    fprintf(stderr, "[STREAM-DBG] process_ubatch: apply done\n");
 
     auto * res = gf_res_prev.get();
     auto * gf  = res->get_gf();
+    fprintf(stderr, "[STREAM-DBG] process_ubatch: calling can_reuse\n");
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
@@ -1093,9 +1123,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //const auto t_start_us = ggml_time_us();
 
+        fprintf(stderr, "[STREAM-DBG] process_ubatch: calling build_graph\n");
         gf = model.build_graph(gparams);
-
-        //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+        fprintf(stderr, "[STREAM-DBG] process_ubatch: build_graph done, gf=%p\n", (void*)gf);
 
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
@@ -1103,18 +1133,21 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        fprintf(stderr, "[STREAM-DBG] process_ubatch: calling alloc_graph\n");
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
+        fprintf(stderr, "[STREAM-DBG] process_ubatch: alloc_graph done\n");
     }
 
     // set the input data for the input tensors
     {
-        //const auto t_start_us = ggml_time_us();
+        fprintf(stderr, "[STREAM-DBG] process_ubatch: calling set_inputs\n");
 
         res->set_inputs(&ubatch);
+        fprintf(stderr, "[STREAM-DBG] process_ubatch: set_inputs done\n");
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
@@ -1419,6 +1452,7 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
+    fprintf(stderr, "[STREAM-DBG] llama_context::decode entered, n_tokens=%d\n", batch_inp.n_tokens);
     GGML_ASSERT((!batch_inp.token && batch_inp.embd) || (batch_inp.token && !batch_inp.embd)); // NOLINT
 
     if (!memory) {
@@ -1497,17 +1531,22 @@ int llama_context::decode(const llama_batch & batch_inp) {
     embd_seq.clear();
     output_swaps.clear();
 
+    fprintf(stderr, "[STREAM-DBG] decode: calling sched_reserve\n");
     sched_reserve();
+    fprintf(stderr, "[STREAM-DBG] decode: sched_reserve done, calling memory_update\n");
 
     bool did_optimize = false;
 
     // handle any pending shifts/copies
-    memory_update(false);
+    bool mem_updated = memory_update(false);
+    fprintf(stderr, "[STREAM-DBG] decode: memory_update returned %d\n", (int)mem_updated);
 
     llama_memory_context_ptr mctx;
 
+    fprintf(stderr, "[STREAM-DBG] decode: calling init_batch\n");
     while (true) {
         mctx = memory->init_batch(*balloc, cparams.n_ubatch, output_all);
+        fprintf(stderr, "[STREAM-DBG] decode: init_batch done, mctx=%p\n", (void*)mctx.get());
         if (!mctx) {
             return -2;
         }
@@ -1515,6 +1554,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         switch (mctx->get_status()) {
             case LLAMA_MEMORY_STATUS_SUCCESS:
                 {
+                    fprintf(stderr, "[STREAM-DBG] decode: mctx status SUCCESS\n");
                 } break;
             case LLAMA_MEMORY_STATUS_NO_UPDATE:
                 {
@@ -1550,15 +1590,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
     }
 
     // reserve output buffer
+    fprintf(stderr, "[STREAM-DBG] decode: calling output_reserve(%d)\n", n_outputs_all);
     if (output_reserve(n_outputs_all) < n_outputs_all) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
         return -2;
     };
+    fprintf(stderr, "[STREAM-DBG] decode: output_reserve done\n");
 
     int64_t n_outputs_prev = 0;
 
     do {
+        fprintf(stderr, "[STREAM-DBG] decode: getting ubatch\n");
         const auto & ubatch = mctx->get_ubatch();
+        fprintf(stderr, "[STREAM-DBG] decode: ubatch n_tokens=%d\n", ubatch.n_tokens);
 
         // count the outputs in this ubatch
         {
@@ -1574,8 +1618,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
             // needs to happen before the graph is built
             n_outputs = n_outputs_new;
+            fprintf(stderr, "[STREAM-DBG] decode: n_outputs=%d\n", n_outputs_new);
         }
 
+        fprintf(stderr, "[STREAM-DBG] decode: calling process_ubatch\n");
         ggml_status status;
         const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_DECODER, mctx.get(), status);
 
@@ -2057,6 +2103,7 @@ ggml_status llama_context::graph_compute(
                    bool   batched) {
     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
+    fprintf(stderr, "[STREAM-DBG] graph_compute: gf=%p streaming_ctx=%p batched=%d\n",(void *) gf, (void *) streaming_ctx.get(), (int) batched);
 
     if (backend_cpu != nullptr) {
         auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
@@ -2071,6 +2118,83 @@ ggml_status llama_context::graph_compute(
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
 
+    // ── Streaming weight fill ────────────────────────────────────────────────
+    // Walk every graph node's source tensors. Any src with data==nullptr that
+    // is registered in the streaming context gets populated now, before the
+    // backend scheduler executes. This is the only chokepoint for both encode
+    // and decode paths since both go through graph_compute().
+    if (streaming_ctx) {
+        int n_filled = 0;
+        int n_sentinel = 0;
+        fprintf(stderr, "[STREAM-DBG] graph_compute: walking %d nodes\n", ggml_graph_n_nodes(gf));
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            ggml_tensor * node = ggml_graph_node(gf, i);
+
+            // Check the node itself (weight tensors appear as leaf nodes)
+            auto fill_tensor = [&](ggml_tensor * t) {
+                if (!t) return;
+                const char * name = ggml_get_name(t);
+                if (!name || name[0] == '\0') return;
+                if (!streaming_ctx->is_streaming(name)) return;
+                if (t->data == (void*)(uintptr_t)1) { n_sentinel++; }
+                if (t->data != nullptr && t->data != (void*)(uintptr_t)1) return; // already resident
+                void * data = streaming_ctx->get_tensor_data(name);
+                if (data) {
+                    t->data   = data;
+                    // Assign the CPU host buffer so the CUDA scheduler can see
+                    // this tensor is in host memory and copy it to GPU correctly.
+                    // With buffer=nullptr the CUDA backend asserts at
+                    // ggml_backend_buffer_get_usage() (ggml-backend.cpp:189).
+                    t->buffer = streaming_ctx->cpu_buffer();
+                    n_filled++;
+                } else {
+                    LLAMA_LOG_ERROR("%s: streaming tensor '%s' returned null data\n", __func__, name);
+                }
+            };
+
+            fill_tensor(node);
+            for (int s = 0; s < GGML_MAX_SRC && node->src[s] != nullptr; ++s) {
+                fill_tensor(node->src[s]);
+            }
+        }
+        fprintf(stderr, "[STREAM-DBG] graph_compute: filled=%d sentinel_found=%d\n", n_filled, n_sentinel);
+    }
+    // ── End streaming weight fill ─────────────────────────────────────────────
+    // Hard guard: no sentinel pointers are allowed to reach backend compute.
+    {
+        ggml_tensor * bad = nullptr;
+
+        for (int i = 0; i < ggml_graph_n_nodes(gf) && bad == nullptr; ++i) {
+            ggml_tensor * node = ggml_graph_node(gf, i);
+
+            if (node && node->data == (void *)(uintptr_t)1) {
+                bad = node;
+                break;
+            }
+
+            if (!node) {
+                continue;
+            }
+
+            for (int s = 0; s < GGML_MAX_SRC && node->src[s] != nullptr; ++s) {
+                ggml_tensor * src = node->src[s];
+                if (src->data == (void *)(uintptr_t)1) {
+                    bad = src;
+                    break;
+                }
+            }
+        }
+
+        if (bad != nullptr) {
+            const char * bad_name = ggml_get_name(bad);
+            LLAMA_LOG_ERROR("%s: sentinel tensor data detected before compute: tensor='%s' ptr=%p streaming_ctx=%p\n",
+                __func__,
+                (bad_name && bad_name[0] != '\0') ? bad_name : "<unnamed>",
+                bad->data,
+                (void *) streaming_ctx.get());
+            return GGML_STATUS_FAILED;
+        }
+    }
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
@@ -2864,6 +2988,7 @@ llama_context * llama_init_from_model(
         return ctx;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: failed to initialize the context: %s\n", __func__, err.what());
+        STREAM_DBG("context init EXCEPTION: %s", err.what());
     }
 
     return nullptr;

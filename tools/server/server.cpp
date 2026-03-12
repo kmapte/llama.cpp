@@ -3,6 +3,7 @@
 #include "server-models.h"
 
 #include "arg.h"
+#include "../../src/llama-stream-debug.h"
 #include "common.h"
 #include "llama.h"
 #include "log.h"
@@ -244,6 +245,7 @@ int main(int argc, char ** argv) {
 
         // load the model
         LOG_INF("%s: loading model\n", __func__);
+        STREAM_DBG("server: calling ctx_server.load_model");
 
         if (!ctx_server.load_model(params)) {
             clean_up();
@@ -254,6 +256,7 @@ int main(int argc, char ** argv) {
             return 1;
         }
 
+        STREAM_DBG("server: load_model succeeded");
         routes.update_meta(ctx_server);
         ctx_http.is_ready.store(true);
 
@@ -292,6 +295,7 @@ int main(int argc, char ** argv) {
         clean_up();
     } else {
         LOG_INF("%s: server is listening on %s\n", __func__, ctx_http.listening_address.c_str());
+        STREAM_DBG("server: NOW LISTENING on %s — startup complete", ctx_http.listening_address.c_str());
         LOG_INF("%s: starting the main loop...\n", __func__);
 
         // optionally, notify router server that this instance is ready
