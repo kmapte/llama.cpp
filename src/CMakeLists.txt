@@ -159,10 +159,17 @@ set_target_properties(llama PROPERTIES
 target_include_directories(llama PRIVATE .)
 target_include_directories(llama PUBLIC ../include)
 # Streaming weight mapper (PoC: absolute path, promote to submodule later)
-target_include_directories(llama PRIVATE "D:/home/dev/code/streaming-weight-mapper")
+target_include_directories(llama PRIVATE "${CMAKE_SOURCE_DIR}/../streaming-weight-mapper")
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 target_link_libraries(llama PUBLIC ggml)
+
+# Link CUDA runtime for streaming weight loader (cudaHostRegister/cudaHostUnregister)
+if (GGML_CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    target_link_libraries(llama PRIVATE CUDA::cudart)
+    target_compile_definitions(llama PRIVATE GGML_USE_CUDA)
+endif()
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
