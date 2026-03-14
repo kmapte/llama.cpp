@@ -741,8 +741,11 @@ private:
 
         slots.clear();
 
-        const bool can_spec = common_speculative_is_compat(ctx);
-        if (!can_spec) {
+        // Skip speculative compat check if no draft model configured.
+        // The check runs a full forward pass which takes 10+ minutes on streaming models.
+        const bool has_spec_model = !params_base.speculative.model.empty();
+        const bool can_spec = has_spec_model && common_speculative_is_compat(ctx);
+        if (has_spec_model && !can_spec) {
             SRV_WRN("%s", "speculative decoding not supported by this context\n");
         }
 
