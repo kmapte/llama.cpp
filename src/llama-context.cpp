@@ -2203,8 +2203,26 @@ ggml_status llama_context::graph_compute(
 
     // After compute finishes, evict views over the LRU budget.
     // Must be AFTER compute — during compute all pointers must stay valid.
+    // After eviction, reset evicted tensors back to sentinel so the next
+    // decode re-fills them. Without this, t->data points to unmapped memory.
     if (streaming_ctx) {
         streaming_ctx->evict_over_budget();
+        // Reset all streaming tensor pointers back to sentinel.
+        // The next graph_compute fill loop will re-map them on demand.
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            ggml_tensor * node = ggml_graph_node(gf, i);
+            auto reset_sentinel = [&](ggml_tensor * t) {
+                if (!t) return;
+                const char * name = ggml_get_name(t);
+                if (!name || name[0] == '\0') return;
+                if (!streaming_ctx->is_streaming(name)) return;
+                t->data   = streaming_ctx->STREAMING_SENTINEL();
+                t->buffer = nullptr;
+            };
+            reset_sentinel(node);
+            for (int s = 0; s < GGML_MAX_SRC && node->src[s]; ++s)
+                reset_sentinel(node->src[s]);
+        }
     }
 
     return status;
