@@ -859,7 +859,7 @@ static int llama_model_load(const std::string & fname, std::vector<std::string> 
                 normalize_path(fname) == normalize_path(std::string(streaming_path_env));
             fprintf(stderr, "[STREAM-DBG] streaming check: fname='%s' env='%s' match=%d\n",
                 fname.c_str(), streaming_path_env ? streaming_path_env : "(not set)", (int)path_match);
-            if (path_match) {
+            if (path_match && !params.no_alloc) {
                 size_t cache_gib = 4;
                 const char * cache_env = getenv("LLAMA_STREAMING_CACHE_GIB");
                 if (cache_env) {
