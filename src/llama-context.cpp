@@ -2201,7 +2201,11 @@ ggml_status llama_context::graph_compute(
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
 
-    // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
+    // After compute finishes, evict views over the LRU budget.
+    // Must be AFTER compute — during compute all pointers must stay valid.
+    if (streaming_ctx) {
+        streaming_ctx->evict_over_budget();
+    }
 
     return status;
 }

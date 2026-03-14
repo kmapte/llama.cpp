@@ -160,9 +160,13 @@ public:
     }
 
     void evict_tensor(const char * name) {
-        // Don't evict pinned buffers eagerly — they're small and reused every token.
-        // The destructor frees them all at shutdown.
         mapper_.evict(name);
+    }
+
+    // Call after each token's compute completes — evicts views over budget.
+    // Never call during graph compute: live pointers would become invalid.
+    void evict_over_budget() {
+        mapper_.evict_over_budget();
     }
 
     void prefetch(const char * name) { mapper_.prefetch(name); }
