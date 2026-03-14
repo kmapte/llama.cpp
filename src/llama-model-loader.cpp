@@ -1097,15 +1097,30 @@ bool llama_model_loader::load_all_data(
         // allocation entirely. The tensor's data pointer stays null; it will
         // be filled by LlamaStreamingContext::get_tensor_data() at inference.
         if (streaming_ctx && streaming_ctx->is_streaming(ggml_get_name(cur))) {
-            // Clear the dummy buffer that no_alloc assigned — streaming context
-            // owns this tensor's data. register_tensor() sets data=SENTINEL so
-            // ggml_gallocr won't try to re-allocate it.
             cur->buffer = nullptr;
             streaming_ctx->register_tensor(ggml_get_name(cur), cur);
-            // NOTE: do NOT prefetch here — data is fetched on demand at inference time only
             size_done += n_size;
-            LLAMA_LOG_DEBUG("%s: streaming tensor '%s' (%.2f MiB) — skipping allocation\n",
-                __func__, ggml_get_name(cur), (double)n_size / (1024.0 * 1024.0));
+            // Progress bar for streaming registration
+            {
+                static int    s_registered  = 0;
+                static size_t s_tracked_mib = 0;
+                s_registered++;
+                s_tracked_mib += n_size / (1024 * 1024);
+                int total   = (int) streaming_ctx->total_tensor_count();
+                int pct     = (total > 0) ? (int)(100.0 * s_registered / total) : 0;
+                int bar_w   = 40;
+                int filled  = (total > 0) ? (bar_w * s_registered / total) : 0;
+                fprintf(stderr, "\r[Streaming] [%.*s%.*s] %d/%d (%d%%)  %zu MiB tracked   ",
+                    filled,    "========================================",
+                    bar_w - filled, "                                        ",
+                    s_registered, total, pct, s_tracked_mib);
+                fflush(stderr);
+                if (s_registered == total) {
+                    fprintf(stderr, "\n");
+                    s_registered  = 0;  // reset for next load
+                    s_tracked_mib = 0;
+                }
+            }
             continue;
         }
         // ── End streaming bypass ──────────────────────────────────────────────

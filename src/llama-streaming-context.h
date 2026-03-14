@@ -87,14 +87,6 @@ public:
         if (cpu_routing_buf_) {
             ggml_backend_buffer_free(cpu_routing_buf_);
         }
-#if STREAMING_CUDA
-        // Free all pinned buffers
-        std::lock_guard<std::mutex> lock(pinned_mutex_);
-        for (auto & kv : pinned_cache_) {
-            if (kv.second.ptr) cudaFreeHost(kv.second.ptr);
-        }
-        pinned_cache_.clear();
-#endif
     }
 
     // ── Registration ─────────────────────────────────────────────────────────
@@ -118,62 +110,15 @@ public:
     // ── Data access ───────────────────────────────────────────────────────────
 
     void * get_tensor_data(const char * name) {
-#if STREAMING_CUDA
-        // On CUDA builds: return a cudaMallocHost pinned buffer.
-        // Windows MapViewOfFile memory cannot be used with cudaHostRegister,
-        // so we copy mmap data into pinned host memory that the GPU can DMA from.
-        {
-            std::lock_guard<std::mutex> lock(pinned_mutex_);
-            auto it = pinned_cache_.find(name);
-            if (it != pinned_cache_.end()) {
-                return it->second.ptr;  // already pinned and ready
-            }
-        }
-
-        // Get mmap pointer (blocks until pages are available)
-        void * mmap_ptr = mapper_.get_tensor_ptr(name);
-        if (!mmap_ptr) return nullptr;
-
-        // Get tensor size directly from mapper descriptor (always correct)
-        size_t sz = mapper_.tensor_size(name);
-        if (sz == 0) {
-            fprintf(stderr, "[STREAM-DBG] tensor_size=0 for '%s' — using mmap ptr directly\n", name);
-            return mmap_ptr;
-        }
-
-        // Allocate pinned host memory and copy from mmap
-        void * pinned = nullptr;
-        cudaError_t err = cudaMallocHost(&pinned, sz);
-        if (err != cudaSuccess) {
-            fprintf(stderr, "[STREAM-DBG] cudaMallocHost failed for '%s' (%zu MiB): %s — falling back to mmap ptr\n",
-                name, sz >> 20, cudaGetErrorString(err));
-            cudaGetLastError();
-            return mmap_ptr;  // fallback: may still crash if -ngl is set
-        }
-
-        memcpy(pinned, mmap_ptr, sz);
-
-        {
-            std::lock_guard<std::mutex> lock(pinned_mutex_);
-            pinned_cache_[name] = {pinned, sz};
-        }
-
-        fprintf(stderr, "[STREAM-DBG] pinned '%s' (%.1f MiB)\n", name, sz / (1024.0*1024));
-        return pinned;
-#else
+        // Return mmap pointer directly. The ggml CUDA scheduler will issue a
+        // cudaMemcpy from host to device automatically when it sees a CPU-buffered
+        // weight tensor being used in a GPU op (triggered by -ngl).
+        // cudaMallocHost / cudaHostRegister on MapViewOfFile memory is not
+        // supported on Windows and causes OOM or illegal access errors.
         return mapper_.get_tensor_ptr(name);
-#endif
     }
 
     void evict_tensor(const char * name) {
-#if STREAMING_CUDA
-        std::lock_guard<std::mutex> lock(pinned_mutex_);
-        auto it = pinned_cache_.find(name);
-        if (it != pinned_cache_.end()) {
-            cudaFreeHost(it->second.ptr);
-            pinned_cache_.erase(it);
-        }
-#endif
         mapper_.evict(name);
     }
 
@@ -183,8 +128,9 @@ public:
 
     ggml_backend_buffer_t cpu_buffer() const { return cpu_routing_buf_; }
 
-    size_t cache_bytes_used() const { return mapper_.cache_bytes_used(); }
-    size_t registered_count() const { return registered_.size(); }
+    size_t cache_bytes_used()   const { return mapper_.cache_bytes_used(); }
+    size_t registered_count()   const { return registered_.size(); }
+    size_t total_tensor_count() const { return mapper_.tensor_count(); }
 
     std::vector<std::string> registered_names() const {
         std::vector<std::string> names;
@@ -198,12 +144,7 @@ private:
     ggml_backend_buffer_t cpu_routing_buf_ = nullptr;
     std::unordered_map<std::string, StreamingTensorInfo> registered_;
 
-#if STREAMING_CUDA
-    // Pinned host buffers — GPU-accessible copies of mmap tensor data.
-    // cudaMallocHost allocates page-locked memory that the GPU can DMA from,
-    // unlike MapViewOfFile memory which cannot be registered with CUDA.
-    struct PinnedBuffer { void * ptr; size_t size; };
-    std::unordered_map<std::string, PinnedBuffer> pinned_cache_;
-    std::mutex pinned_mutex_;
-#endif
+    // Note: cudaMallocHost / cudaHostRegister on Windows MapViewOfFile memory
+    // is not supported. CUDA scheduler handles host->device copies automatically
+    // via cudaMemcpy when it processes ops involving CPU-buffered weight tensors.
 };
