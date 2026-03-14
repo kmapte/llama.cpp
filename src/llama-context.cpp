@@ -2141,11 +2141,12 @@ ggml_status llama_context::graph_compute(
                 void * data = streaming_ctx->get_tensor_data(name);
                 if (data) {
                     t->data   = data;
-                    // Assign the CPU host buffer so the CUDA scheduler can see
-                    // this tensor is in host memory and copy it to GPU correctly.
-                    // With buffer=nullptr the CUDA backend asserts at
-                    // ggml_backend_buffer_get_usage() (ggml-backend.cpp:189).
-                    t->buffer = streaming_ctx->cpu_buffer();
+                    // Use the buffer that matches where the data actually lives:
+                    //   - pinned CUDA host buffer → CUDA scheduler can DMA to VRAM
+                    //   - plain CPU buffer        → CPU compute only
+                    // This is what makes -ngl work: pinned tensors get the CUDA
+                    // host buffer type which the CUDA backend accepts without asserting.
+                    t->buffer = streaming_ctx->get_tensor_buffer(ggml_get_name(t));
                     n_filled++;
                 } else {
                     LLAMA_LOG_ERROR("%s: streaming tensor '%s' returned null data\n", __func__, name);
