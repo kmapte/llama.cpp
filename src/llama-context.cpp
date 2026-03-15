@@ -10,14 +10,11 @@
 #include "llama-mmap.h"
 #include "llama-model.h"
 
-#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
-#include <unordered_set>
-#include <vector>
 
 //
 // llama_context
@@ -2131,55 +2128,27 @@ ggml_status llama_context::graph_compute(
         int n_sentinel = 0;
         fprintf(stderr, "[STREAM-DBG] graph_compute: walking %d nodes\n", ggml_graph_n_nodes(gf));
 
-        // ── Pass 1: collect all sentinel tensors sorted by file offset ────────
-        // Sorting by file_offset turns random NVMe seeks into sequential reads,
-        // using the drive's full sequential bandwidth (~3400 MB/s) instead of
-        // random access speed (~700 MB/s). 4-5x speedup per token.
-        struct SentinelEntry {
-            uint64_t      file_offset;
-            std::string   name;
-            ggml_tensor * tensor;
-        };
-        std::vector<SentinelEntry> sentinels;
-        sentinels.reserve(1025);
-
-        // Collect all unique sentinel tensors across nodes and srcs
-        std::unordered_set<ggml_tensor*> seen;
         for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
             ggml_tensor * node = ggml_graph_node(gf, i);
-            auto collect = [&](ggml_tensor * t) {
-                if (!t || seen.count(t)) return;
-                seen.insert(t);
+            auto fill_tensor = [&](ggml_tensor * t) {
+                if (!t) return;
                 const char * name = ggml_get_name(t);
                 if (!name || name[0] == '\0') return;
                 if (!streaming_ctx->is_streaming(name)) return;
-                if (t->data == (void*)(uintptr_t)1) {
-                    n_sentinel++;
-                    sentinels.push_back({streaming_ctx->get_file_offset(name), name, t});
+                if (t->data == (void*)(uintptr_t)1) { n_sentinel++; }
+                if (t->data != nullptr && t->data != (void*)(uintptr_t)1) return;
+                void * data = streaming_ctx->get_tensor_data(name);
+                if (data) {
+                    t->data   = data;
+                    t->buffer = streaming_ctx->get_tensor_buffer(name);
+                    n_filled++;
+                } else {
+                    LLAMA_LOG_ERROR("%s: streaming tensor '%s' returned null data\n", __func__, name);
                 }
             };
-            collect(node);
+            fill_tensor(node);
             for (int s = 0; s < GGML_MAX_SRC && node->src[s]; ++s)
-                collect(node->src[s]);
-        }
-
-        // Sort by file_offset — sequential NVMe reads
-        std::sort(sentinels.begin(), sentinels.end(),
-            [](const SentinelEntry & a, const SentinelEntry & b) {
-                return a.file_offset < b.file_offset;
-            });
-
-        // ── Pass 2: read tensors in sorted file order ─────────────────────
-        // Sequential file access + PrefetchVirtualMemory gives bulk IO.
-        for (size_t idx = 0; idx < sentinels.size(); ++idx) {
-            void * data = streaming_ctx->get_tensor_data(sentinels[idx].name.c_str());
-            if (data) {
-                sentinels[idx].tensor->data   = data;
-                sentinels[idx].tensor->buffer = streaming_ctx->get_tensor_buffer(sentinels[idx].name.c_str());
-                n_filled++;
-            } else {
-                LLAMA_LOG_ERROR("%s: streaming tensor '%s' returned null data\n", __func__, sentinels[idx].name.c_str());
-            }
+                fill_tensor(node->src[s]);
         }
 
         fprintf(stderr, "[STREAM-DBG] graph_compute: filled=%d sentinel_found=%d\n", n_filled, n_sentinel);
