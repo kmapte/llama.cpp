@@ -177,6 +177,12 @@ public:
     size_t total_tensor_count()                const { return mapper_.tensor_count(); }
     size_t pinned_bytes_used()                 const { return pinned_used_; }
 
+    // Returns absolute file offset for a tensor — used to sort reads
+    // by file position for sequential NVMe IO (4-5x faster than random).
+    uint64_t get_file_offset(const char * name) const {
+        return mapper_.file_offset(name);
+    }
+
     std::vector<std::string> registered_names() const {
         std::vector<std::string> names;
         names.reserve(registered_.size());
