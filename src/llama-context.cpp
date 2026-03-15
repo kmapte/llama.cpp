@@ -2227,33 +2227,25 @@ ggml_status llama_context::graph_compute(
 
     // After compute finishes, evict views over the LRU budget.
     // Must be AFTER compute — during compute all pointers must stay valid.
+    // After eviction, reset evicted tensors back to sentinel so the next
+    // decode re-fills them. Without this, t->data points to unmapped memory.
     if (streaming_ctx) {
-        // Get list of tensors that will be evicted BEFORE evicting them
-        // so we can reset only those tensors to sentinel.
-        // Tensors that stay cached keep their valid data pointers —
-        // avoiding unnecessary MapViewOfFile calls next token.
-        auto evicted = streaming_ctx->evict_over_budget_with_list();
-
-        if (!evicted.empty()) {
-            // Build a fast lookup set of evicted tensor names
-            std::unordered_set<std::string> evicted_set(evicted.begin(), evicted.end());
-
-            // Only reset tensors that were actually evicted
-            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
-                ggml_tensor * node = ggml_graph_node(gf, i);
-                auto reset_if_evicted = [&](ggml_tensor * t) {
-                    if (!t) return;
-                    const char * name = ggml_get_name(t);
-                    if (!name || name[0] == '\0') return;
-                    if (evicted_set.count(name)) {
-                        t->data   = streaming_ctx->STREAMING_SENTINEL();
-                        t->buffer = nullptr;
-                    }
-                };
-                reset_if_evicted(node);
-                for (int s = 0; s < GGML_MAX_SRC && node->src[s]; ++s)
-                    reset_if_evicted(node->src[s]);
-            }
+        streaming_ctx->evict_over_budget();
+        // Reset all streaming tensor pointers back to sentinel.
+        // The next graph_compute fill loop will re-map them on demand.
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            ggml_tensor * node = ggml_graph_node(gf, i);
+            auto reset_sentinel = [&](ggml_tensor * t) {
+                if (!t) return;
+                const char * name = ggml_get_name(t);
+                if (!name || name[0] == '\0') return;
+                if (!streaming_ctx->is_streaming(name)) return;
+                t->data   = streaming_ctx->STREAMING_SENTINEL();
+                t->buffer = nullptr;
+            };
+            reset_sentinel(node);
+            for (int s = 0; s < GGML_MAX_SRC && node->src[s]; ++s)
+                reset_sentinel(node->src[s]);
         }
     }
 
