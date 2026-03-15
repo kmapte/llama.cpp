@@ -2169,19 +2169,9 @@ ggml_status llama_context::graph_compute(
                 return a.file_offset < b.file_offset;
             });
 
-        // ── Pass 2: read tensors in file order, assign pointers ──────────────
-        // Prefetch tensor[i+1] while waiting for tensor[i] to load.
-        // This overlaps NVMe IO with the PrefetchVirtualMemory blocking call,
-        // keeping the NVMe busy continuously instead of idle between tensors.
-        if (!sentinels.empty()) {
-            // Kick off the first prefetch
-            streaming_ctx->prefetch(sentinels[0].name.c_str());
-        }
+        // ── Pass 2: read tensors in sorted file order ─────────────────────
+        // Sequential file access + PrefetchVirtualMemory gives bulk IO.
         for (size_t idx = 0; idx < sentinels.size(); ++idx) {
-            // Prefetch next tensor before blocking on current
-            if (idx + 1 < sentinels.size()) {
-                streaming_ctx->prefetch(sentinels[idx + 1].name.c_str());
-            }
             void * data = streaming_ctx->get_tensor_data(sentinels[idx].name.c_str());
             if (data) {
                 sentinels[idx].tensor->data   = data;
