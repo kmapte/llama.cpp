@@ -164,9 +164,10 @@ public:
     }
 
     // Call after each token's compute completes — evicts views over budget.
+    // Returns list of evicted tensor names so caller can reset only those sentinels.
     // Never call during graph compute: live pointers would become invalid.
-    void evict_over_budget() {
-        mapper_.evict_over_budget();
+    std::vector<std::string> evict_over_budget_with_list() {
+        return mapper_.evict_over_budget_with_list();
     }
 
     void prefetch(const char * name) { mapper_.prefetch(name); }
